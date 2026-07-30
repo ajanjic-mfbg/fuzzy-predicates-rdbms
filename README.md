@@ -13,8 +13,6 @@ membership degrees.
 ## Repository contents
 
 - `sql/` – SQL implementations of the database designs considered in the paper.
-- `benchmarks/` – benchmark scripts, configuration information, and experimental
-  results.
 
 - The `D*.sql` files create the individual database designs.
 - `example_data.sql` populates a created database with the geographic-coordinate

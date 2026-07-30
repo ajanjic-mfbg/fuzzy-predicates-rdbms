@@ -16,5 +16,9 @@ membership degrees.
 - `benchmarks/` – benchmark scripts, configuration information, and experimental
   results.
 
+- The `D*.sql` files create the individual database designs.
+- `example_data.sql` populates a created database with the geographic-coordinate
+example used in the paper.
+
 The repository is currently being prepared and additional reproducibility
 materials will be added.

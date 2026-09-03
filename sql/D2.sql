@@ -1,11 +1,10 @@
--- D5: function-based view for two-dimensional predicate memberships
+-- D2: view-based calculation of two-dimensional predicate memberships
 --
--- This script creates the tables, membership functions and the predicate_sat
--- view used by design D5. No membership degrees are stored and no triggers are
--- used. The function compute_memb_1d obtains the definition of a predicate
--- segment from the database, while compute_memb_2d calls it for both dimensions
--- and combines the returned values. The predicate_sat view calls
--- compute_memb_2d for the point--predicate pairs.
+-- This script creates the tables, helper view, membership functions and the
+-- predicate_sat view used by design D2. No membership degrees are stored and no
+-- triggers are used. The view obtains the predicate parameters, excludes
+-- point--predicate pairs outside the relevant domains or supports, and calculates
+-- the remaining two-dimensional memberships when they are needed.
 --
 -- The example data are stored in example_data.sql. Run this script first and
 -- then execute example_data.sql in the same MariaDB database.
@@ -230,99 +229,54 @@ BEGIN
 END//
 
 -- -----------------------------------------------------------------------------
--- Membership functions that read predicate definitions from the database
+-- Two-dimensional membership function
 -- -----------------------------------------------------------------------------
 
--- Obtains the definition of a predicate segment and calculates the membership
--- of the supplied coordinate. If the coordinate is outside the domain or the
--- segment support, the SELECT returns no row and the function returns zero.
-CREATE FUNCTION compute_memb_1d (
-    p_position FLOAT,
-    p_pred_segment_id INT
+-- Calculates a two-dimensional membership as the product of the two one-dimensional memberships.
+CREATE FUNCTION predicate_sat (
+    pos_x FLOAT,
+    pos_y FLOAT,
+    domain_min_x FLOAT,
+    domain_max_x FLOAT,
+    domain_min_y FLOAT,
+    domain_max_y FLOAT,
+    segment_min_x FLOAT,
+    segment_max_x FLOAT,
+    segment_min_y FLOAT,
+    segment_max_y FLOAT,
+    alpha_x FLOAT,
+    beta_x FLOAT,
+    alpha_y FLOAT,
+    beta_y FLOAT
 )
 RETURNS FLOAT
-NOT DETERMINISTIC
-READS SQL DATA
+DETERMINISTIC
+NO SQL
 BEGIN
-    DECLARE v_domain_min FLOAT DEFAULT NULL;
-    DECLARE v_domain_max FLOAT DEFAULT NULL;
-    DECLARE v_segment_min FLOAT DEFAULT NULL;
-    DECLARE v_segment_max FLOAT DEFAULT NULL;
-    DECLARE v_alpha FLOAT DEFAULT NULL;
-    DECLARE v_beta FLOAT DEFAULT NULL;
-    DECLARE v_found BOOLEAN DEFAULT TRUE;
+    DECLARE memb_x FLOAT;
+    DECLARE memb_y FLOAT;
 
-    DECLARE CONTINUE HANDLER FOR NOT FOUND
-        SET v_found = FALSE;
-
-    SELECT
-        pd.domain_min,
-        pd.domain_max,
-        pd.segment_min,
-        pd.segment_max,
-        pd.alpha,
-        pd.beta
-    INTO
-        v_domain_min,
-        v_domain_max,
-        v_segment_min,
-        v_segment_max,
-        v_alpha,
-        v_beta
-    FROM pred_detailed_v AS pd
-    WHERE pd.psid = p_pred_segment_id
-
-      -- The coordinate must lie inside the declared dimension domain.
-      AND p_position BETWEEN pd.domain_min AND pd.domain_max
-
-      -- The coordinate must lie inside the support of the predicate segment.
-      AND p_position >
-          (pd.segment_min + pd.segment_max) / 2
-          - pd.beta * (pd.segment_max - pd.segment_min) / 2
-      AND p_position <
-          (pd.segment_min + pd.segment_max) / 2
-          + pd.beta * (pd.segment_max - pd.segment_min) / 2;
-
-    IF NOT v_found THEN
-        RETURN 0.0;
-    END IF;
-
-    RETURN membership_1d(
-        p_position,
-        v_domain_min,
-        v_domain_max,
-        v_segment_min,
-        v_segment_max,
-        v_alpha,
-        v_beta
-    );
-END//
-
--- Calls compute_memb_1d for both dimensions and multiplies the returned values.
-CREATE FUNCTION compute_memb_2d (
-    p_pos_x FLOAT,
-    p_pos_y FLOAT,
-    p_pred_x INT,
-    p_pred_y INT
-)
-RETURNS FLOAT
-NOT DETERMINISTIC
-READS SQL DATA
-BEGIN
-    DECLARE v_memb_x FLOAT DEFAULT 0.0;
-    DECLARE v_memb_y FLOAT DEFAULT 0.0;
-
-    SET v_memb_x = compute_memb_1d(
-        p_pos_x,
-        p_pred_x
+    SET memb_x = membership_1d(
+        pos_x,
+        domain_min_x,
+        domain_max_x,
+        segment_min_x,
+        segment_max_x,
+        alpha_x,
+        beta_x
     );
 
-    SET v_memb_y = compute_memb_1d(
-        p_pos_y,
-        p_pred_y
+    SET memb_y = membership_1d(
+        pos_y,
+        domain_min_y,
+        domain_max_y,
+        segment_min_y,
+        segment_max_y,
+        alpha_y,
+        beta_y
     );
 
-    RETURN v_memb_x * v_memb_y;
+    RETURN memb_x * memb_y;
 END//
 
 DELIMITER ;
@@ -331,22 +285,55 @@ DELIMITER ;
 -- View with two-dimensional predicate memberships
 -- -----------------------------------------------------------------------------
 
--- Calls compute_memb_2d for every point--predicate pair and removes the rows
--- whose membership is zero.
+-- Calculates nonzero two-dimensional memberships when they are requested.
+-- Domain and support conditions remove combinations with zero membership before
+-- the two-dimensional membership function is called.
 CREATE VIEW predicate_sat AS
 WITH memb_2d AS (
     SELECT
         pt.pid,
         p.pred_x,
         p.pred_y,
-        compute_memb_2d(
+        predicate_sat(
             pt.position_x,
             pt.position_y,
-            p.pred_x,
-            p.pred_y
+            pdx.domain_min,
+            pdx.domain_max,
+            pdy.domain_min,
+            pdy.domain_max,
+            pdx.segment_min,
+            pdx.segment_max,
+            pdy.segment_min,
+            pdy.segment_max,
+            pdx.alpha,
+            pdx.beta,
+            pdy.alpha,
+            pdy.beta
         ) AS mu
     FROM point AS pt
     CROSS JOIN predicate_2d AS p
+    JOIN pred_detailed_v AS pdx
+        ON p.pred_x = pdx.psid
+    JOIN pred_detailed_v AS pdy
+        ON p.pred_y = pdy.psid
+    WHERE pt.position_x BETWEEN pdx.domain_min AND pdx.domain_max
+      AND pt.position_y BETWEEN pdy.domain_min AND pdy.domain_max
+
+      -- The x-coordinate must lie inside the support of the x-segment.
+      AND pt.position_x >
+          (pdx.segment_min + pdx.segment_max) / 2
+          - pdx.beta * (pdx.segment_max - pdx.segment_min) / 2
+      AND pt.position_x <
+          (pdx.segment_min + pdx.segment_max) / 2
+          + pdx.beta * (pdx.segment_max - pdx.segment_min) / 2
+
+      -- The y-coordinate must lie inside the support of the y-segment.
+      AND pt.position_y >
+          (pdy.segment_min + pdy.segment_max) / 2
+          - pdy.beta * (pdy.segment_max - pdy.segment_min) / 2
+      AND pt.position_y <
+          (pdy.segment_min + pdy.segment_max) / 2
+          + pdy.beta * (pdy.segment_max - pdy.segment_min) / 2
 )
 SELECT
     pid,

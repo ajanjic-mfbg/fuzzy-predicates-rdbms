@@ -1,9 +1,13 @@
--- D1: stored two-dimensional predicate memberships
+-- D4: stored one-dimensional memberships with a two-dimensional view
 --
--- This script creates the tables, views, membership functions and triggers used
--- by design D1. The nonzero two-dimensional membership degrees are stored in
--- the predicate_sat table. The triggers maintain this table when points are
--- inserted or their coordinates are changed.
+-- This script creates the tables, membership functions and triggers used by
+-- design D4. The nonzero one-dimensional memberships are stored separately for
+-- the x- and y-coordinates. The predicate_sat view combines these stored values
+-- to calculate the two-dimensional memberships when they are needed.
+--
+-- Predicate definitions should normally be inserted before the points. If a
+-- predicate segment is changed later, the stored one-dimensional memberships
+-- have to be recalculated.
 --
 -- The example data are stored in example_data.sql. Run this script first and
 -- then execute example_data.sql in the same MariaDB database.
@@ -68,20 +72,35 @@ CREATE TABLE predicate_2d (
         FOREIGN KEY (pred_y) REFERENCES pred_segment (psid)
 ) ENGINE = InnoDB;
 
--- Contains the nonzero two-dimensional membership degrees.
-CREATE TABLE predicate_sat (
+-- Contains the nonzero memberships of x-coordinates in x-axis predicate segments.
+CREATE TABLE point_memb_x (
     pid INT NOT NULL,
-    pred_x INT NOT NULL,
-    pred_y INT NOT NULL,
+    psid INT NOT NULL,
     mu FLOAT NOT NULL,
-    PRIMARY KEY (pid, pred_x, pred_y),
-    CONSTRAINT fk_predicate_sat_point
+    PRIMARY KEY (pid, psid),
+    INDEX idx_point_memb_x_segment (psid, pid),
+    CONSTRAINT fk_point_memb_x_point
         FOREIGN KEY (pid) REFERENCES point (pid)
         ON DELETE CASCADE,
-    CONSTRAINT fk_predicate_sat_predicate
-        FOREIGN KEY (pred_x, pred_y)
-        REFERENCES predicate_2d (pred_x, pred_y),
-    CONSTRAINT chk_predicate_sat_mu
+    CONSTRAINT fk_point_memb_x_segment
+        FOREIGN KEY (psid) REFERENCES pred_segment (psid),
+    CONSTRAINT chk_point_memb_x_mu
+        CHECK (mu > 0 AND mu <= 1)
+) ENGINE = InnoDB;
+
+-- Contains the nonzero memberships of y-coordinates in y-axis predicate segments.
+CREATE TABLE point_memb_y (
+    pid INT NOT NULL,
+    psid INT NOT NULL,
+    mu FLOAT NOT NULL,
+    PRIMARY KEY (pid, psid),
+    INDEX idx_point_memb_y_segment (psid, pid),
+    CONSTRAINT fk_point_memb_y_point
+        FOREIGN KEY (pid) REFERENCES point (pid)
+        ON DELETE CASCADE,
+    CONSTRAINT fk_point_memb_y_segment
+        FOREIGN KEY (psid) REFERENCES pred_segment (psid),
+    CONSTRAINT chk_point_memb_y_mu
         CHECK (mu > 0 AND mu <= 1)
 ) ENGINE = InnoDB;
 
@@ -244,148 +263,185 @@ BEGIN
     END IF;
 END//
 
--- -----------------------------------------------------------------------------
--- Two-dimensional membership function
--- -----------------------------------------------------------------------------
-
--- Calculates a two-dimensional membership as the product of the two one-dimensional memberships.
-CREATE FUNCTION predicate_sat (
-    pos_x FLOAT,
-    pos_y FLOAT,
-    domain_min_x FLOAT,
-    domain_max_x FLOAT,
-    domain_min_y FLOAT,
-    domain_max_y FLOAT,
-    segment_min_x FLOAT,
-    segment_max_x FLOAT,
-    segment_min_y FLOAT,
-    segment_max_y FLOAT,
-    alpha_x FLOAT,
-    beta_x FLOAT,
-    alpha_y FLOAT,
-    beta_y FLOAT
-)
-RETURNS FLOAT
-DETERMINISTIC
-NO SQL
-BEGIN
-    DECLARE memb_x FLOAT;
-    DECLARE memb_y FLOAT;
-
-    SET memb_x = membership_1d(
-        pos_x,
-        domain_min_x,
-        domain_max_x,
-        segment_min_x,
-        segment_max_x,
-        alpha_x,
-        beta_x
-    );
-
-    SET memb_y = membership_1d(
-        pos_y,
-        domain_min_y,
-        domain_max_y,
-        segment_min_y,
-        segment_max_y,
-        alpha_y,
-        beta_y
-    );
-
-    RETURN memb_x * memb_y;
-END//
+DELIMITER ;
 
 -- -----------------------------------------------------------------------------
--- Trigger for point insertion
+-- View with two-dimensional predicate memberships
 -- -----------------------------------------------------------------------------
 
--- Calculates and stores the nonzero memberships of a newly inserted point.
+-- Combines the stored x- and y-memberships and calculates their product.
+-- Since only positive one-dimensional memberships are stored, all rows returned
+-- by this join also have a positive two-dimensional membership.
+CREATE VIEW predicate_sat AS
+SELECT
+    mx.pid,
+    p.pred_x,
+    p.pred_y,
+    mx.mu * my.mu AS mu
+FROM predicate_2d AS p
+JOIN point_memb_x AS mx
+    ON mx.psid = p.pred_x
+JOIN point_memb_y AS my
+    ON my.pid = mx.pid
+   AND my.psid = p.pred_y;
+
+-- -----------------------------------------------------------------------------
+-- Triggers for the one-dimensional membership tables
+-- -----------------------------------------------------------------------------
+
+DELIMITER //
+
+-- Calculates and stores the nonzero one-dimensional memberships of a newly
+-- inserted point. The same trigger updates both membership tables.
 CREATE TRIGGER after_point_insert
 AFTER INSERT ON point
 FOR EACH ROW
 BEGIN
-    INSERT INTO predicate_sat (pid, pred_x, pred_y, mu)
+    INSERT INTO point_memb_x (pid, psid, mu)
     SELECT
         NEW.pid,
-        membership_values.pred_x,
-        membership_values.pred_y,
+        membership_values.psid,
         membership_values.mu
     FROM (
         SELECT
-            p.pred_x,
-            p.pred_y,
-            predicate_sat(
+            pd.psid,
+            membership_1d(
                 NEW.position_x,
-                NEW.position_y,
-                pdx.domain_min,
-                pdx.domain_max,
-                pdy.domain_min,
-                pdy.domain_max,
-                pdx.segment_min,
-                pdx.segment_max,
-                pdy.segment_min,
-                pdy.segment_max,
-                pdx.alpha,
-                pdx.beta,
-                pdy.alpha,
-                pdy.beta
+                pd.domain_min,
+                pd.domain_max,
+                pd.segment_min,
+                pd.segment_max,
+                pd.alpha,
+                pd.beta
             ) AS mu
-        FROM predicate_2d AS p
-        JOIN pred_detailed_v AS pdx
-            ON p.pred_x = pdx.psid
-        JOIN pred_detailed_v AS pdy
-            ON p.pred_y = pdy.psid
-        WHERE NEW.position_x BETWEEN pdx.domain_min AND pdx.domain_max
-          AND NEW.position_y BETWEEN pdy.domain_min AND pdy.domain_max
+        FROM pred_detailed_v AS pd
+        WHERE EXISTS (
+            SELECT 1
+            FROM predicate_2d AS p
+            WHERE p.pred_x = pd.psid
+        )
+          AND NEW.position_x BETWEEN pd.domain_min AND pd.domain_max
+          AND NEW.position_x >
+              (pd.segment_min + pd.segment_max) / 2
+              - pd.beta * (pd.segment_max - pd.segment_min) / 2
+          AND NEW.position_x <
+              (pd.segment_min + pd.segment_max) / 2
+              + pd.beta * (pd.segment_max - pd.segment_min) / 2
+    ) AS membership_values
+    WHERE membership_values.mu > 0;
+
+    INSERT INTO point_memb_y (pid, psid, mu)
+    SELECT
+        NEW.pid,
+        membership_values.psid,
+        membership_values.mu
+    FROM (
+        SELECT
+            pd.psid,
+            membership_1d(
+                NEW.position_y,
+                pd.domain_min,
+                pd.domain_max,
+                pd.segment_min,
+                pd.segment_max,
+                pd.alpha,
+                pd.beta
+            ) AS mu
+        FROM pred_detailed_v AS pd
+        WHERE EXISTS (
+            SELECT 1
+            FROM predicate_2d AS p
+            WHERE p.pred_y = pd.psid
+        )
+          AND NEW.position_y BETWEEN pd.domain_min AND pd.domain_max
+          AND NEW.position_y >
+              (pd.segment_min + pd.segment_max) / 2
+              - pd.beta * (pd.segment_max - pd.segment_min) / 2
+          AND NEW.position_y <
+              (pd.segment_min + pd.segment_max) / 2
+              + pd.beta * (pd.segment_max - pd.segment_min) / 2
     ) AS membership_values
     WHERE membership_values.mu > 0;
 END//
 
--- Recalculates the stored memberships when a point's coordinates change.
--- Changing only the point name does not require recalculation.
+-- Recalculates the one-dimensional memberships affected by a coordinate change.
+-- If only one coordinate changes, only the corresponding table is rebuilt.
 CREATE TRIGGER after_point_update
 AFTER UPDATE ON point
 FOR EACH ROW
 BEGIN
-    IF NOT (NEW.position_x <=> OLD.position_x)
-       OR NOT (NEW.position_y <=> OLD.position_y) THEN
-
-        DELETE FROM predicate_sat
+    IF NOT (NEW.position_x <=> OLD.position_x) THEN
+        DELETE FROM point_memb_x
         WHERE pid = OLD.pid;
 
-        INSERT INTO predicate_sat (pid, pred_x, pred_y, mu)
+        INSERT INTO point_memb_x (pid, psid, mu)
         SELECT
             NEW.pid,
-            membership_values.pred_x,
-            membership_values.pred_y,
+            membership_values.psid,
             membership_values.mu
         FROM (
             SELECT
-                p.pred_x,
-                p.pred_y,
-                predicate_sat(
+                pd.psid,
+                membership_1d(
                     NEW.position_x,
-                    NEW.position_y,
-                    pdx.domain_min,
-                    pdx.domain_max,
-                    pdy.domain_min,
-                    pdy.domain_max,
-                    pdx.segment_min,
-                    pdx.segment_max,
-                    pdy.segment_min,
-                    pdy.segment_max,
-                    pdx.alpha,
-                    pdx.beta,
-                    pdy.alpha,
-                    pdy.beta
+                    pd.domain_min,
+                    pd.domain_max,
+                    pd.segment_min,
+                    pd.segment_max,
+                    pd.alpha,
+                    pd.beta
                 ) AS mu
-            FROM predicate_2d AS p
-            JOIN pred_detailed_v AS pdx
-                ON p.pred_x = pdx.psid
-            JOIN pred_detailed_v AS pdy
-                ON p.pred_y = pdy.psid
-            WHERE NEW.position_x BETWEEN pdx.domain_min AND pdx.domain_max
-              AND NEW.position_y BETWEEN pdy.domain_min AND pdy.domain_max
+            FROM pred_detailed_v AS pd
+            WHERE EXISTS (
+                SELECT 1
+                FROM predicate_2d AS p
+                WHERE p.pred_x = pd.psid
+            )
+              AND NEW.position_x BETWEEN pd.domain_min AND pd.domain_max
+              AND NEW.position_x >
+                  (pd.segment_min + pd.segment_max) / 2
+                  - pd.beta * (pd.segment_max - pd.segment_min) / 2
+              AND NEW.position_x <
+                  (pd.segment_min + pd.segment_max) / 2
+                  + pd.beta * (pd.segment_max - pd.segment_min) / 2
+        ) AS membership_values
+        WHERE membership_values.mu > 0;
+    END IF;
+
+    IF NOT (NEW.position_y <=> OLD.position_y) THEN
+        DELETE FROM point_memb_y
+        WHERE pid = OLD.pid;
+
+        INSERT INTO point_memb_y (pid, psid, mu)
+        SELECT
+            NEW.pid,
+            membership_values.psid,
+            membership_values.mu
+        FROM (
+            SELECT
+                pd.psid,
+                membership_1d(
+                    NEW.position_y,
+                    pd.domain_min,
+                    pd.domain_max,
+                    pd.segment_min,
+                    pd.segment_max,
+                    pd.alpha,
+                    pd.beta
+                ) AS mu
+            FROM pred_detailed_v AS pd
+            WHERE EXISTS (
+                SELECT 1
+                FROM predicate_2d AS p
+                WHERE p.pred_y = pd.psid
+            )
+              AND NEW.position_y BETWEEN pd.domain_min AND pd.domain_max
+              AND NEW.position_y >
+                  (pd.segment_min + pd.segment_max) / 2
+                  - pd.beta * (pd.segment_max - pd.segment_min) / 2
+              AND NEW.position_y <
+                  (pd.segment_min + pd.segment_max) / 2
+                  + pd.beta * (pd.segment_max - pd.segment_min) / 2
         ) AS membership_values
         WHERE membership_values.mu > 0;
     END IF;
